@@ -1,6 +1,6 @@
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-async function callLLM(messages) {
+async function generateReply(messages, attempt = 1) {
 	if (!OPENAI_API_KEY) {
 		const error = new Error("OPENAI_API_KEY is not set");
 		error.statusCode = 500;
@@ -30,7 +30,7 @@ async function callLLM(messages) {
 					type: "text",
 				},
 			},
-			max_output_tokens: 300,
+			max_output_tokens: attempt === 1 ? 800 : 1500,
 		}),
 	});
 
@@ -49,6 +49,7 @@ async function callLLM(messages) {
 	}
 
 	const data = await response.json();
+	console.log("LLM raw response:", JSON.stringify(data, null, 2));
 	if (data?.usage) {
 		console.log("LLM token usage:", {
 			prompt_tokens: data.usage.input_tokens,
@@ -82,11 +83,6 @@ async function callLLM(messages) {
 	return content;
 }
 
-async function generateReply(conversation) {
-	return callLLM(conversation);
-}
-
 module.exports = {
-	callLLM,
 	generateReply,
 };

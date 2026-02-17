@@ -1,67 +1,144 @@
 const express = require("express");
-
 const { generateReply } = require("../ai/llmClient");
 
-const conversation = [
-	{
-		role: "system",
-		content: `
-		You are a strict Grade 6 math tutor.
-		Rules:
-		- Only solve mathematical problems.
-		- If input is not a math problem, respond exactly:
-			{"is_math_question": false}
-		- Always respond in valid JSON format.
-		- Never include extra text outside JSON.
+const sessions = {};
 
-		JSON format:
-		{
-			"is_math_question": boolean,
-			"final_answer": string,
-			"steps": string[],
-			"explanation": string
-		}
+const lessonSystemPrompt =
+	'You are a Grade 6 math tutor. Respond ONLY in valid JSON. If mode is lesson, respond in this format: {"type": "lesson", "topic": string, "concepts": string[], "examples": [{"problem": string, "solution_steps": string[], "final_answer": string}]}. Explain the topic clearly, cover key concepts, and provide 2-3 worked examples. Keep explanations concise but complete. Do not include text outside JSON.';
 
-		Constraints:
-		- Keep explanation under 30 words.
-		- Steps must be concise.
-		`,
-	},
-];
+const practiceSystemPrompt =
+	'You are a Grade 6 math tutor. Respond ONLY in valid JSON. JSON format: {"final_answer": string, "steps": string[], "explanation": string}. Keep explanation under 60 words. Do not include text outside JSON.';
 
 const router = express.Router();
 
 router.post("/", async (req, res) => {
 	try {
-		const { message } = req.body;
+		const { sessionId, message, topic } = req.body;
 
-		if (!message || typeof message !== "string") {
-			return res.status(400).json({ error: "message is required" });
+		if (!sessionId || typeof sessionId !== "string") {
+			return res.status(400).json({ error: "sessionId is required" });
 		}
-		conversation.push({ role: "user", content: message });
 
-		const reply = await generateReply(conversation);
+		if ((message && typeof message !== "string") || (!message && !topic)) {
+			return res.status(400).json({ error: "message or topic is required" });
+		}
+
+		if (!sessions[sessionId]) {
+			sessions[sessionId] = {
+				mode: "lesson",
+				topic: topic || "arithmetic",
+				difficulty: "easy",
+				lessonStarted: false,
+				problemsSolved: 0,
+				correctAnswers: 0,
+			};
+		}
+
+		if (topic) {
+			sessions[sessionId].topic = topic;
+		}
+
+		const studentState = sessions[sessionId];
+
+		if (!studentState.lessonStarted) {
+			studentState.topic = message;
+			studentState.lessonStarted = true;
+			studentState.mode = "lesson";
+
+			const lessonMessages = [
+				{ role: "system", content: lessonSystemPrompt },
+				{
+					role: "user",
+					content: `Explain the topic: ${studentState.topic} for Grade 6 level with examples.`,
+				},
+			];
+
+			let reply;
+			let parsedReply;
+			let lastParseError;
+			for (let attempt = 1; attempt <= 3; attempt += 1) {
+				reply = await generateReply(lessonMessages);
+				try {
+					parsedReply = JSON.parse(reply);
+					lastParseError = null;
+					break;
+				} catch (parseError) {
+					lastParseError = parseError;
+					console.error(
+						`Failed to parse LLM JSON (attempt ${attempt}):`,
+						parseError,
+					);
+				}
+			}
+
+			if (!parsedReply) {
+				console.error("All JSON parse attempts failed:", lastParseError);
+				return res
+					.status(502)
+					.json({ error: "Server issue. Please try again in some time" });
+			}
+
+			return res.status(200).json({
+				...parsedReply,
+				topic: studentState.topic,
+			});
+		}
+
+		const messages = [
+			{ role: "system", content: practiceSystemPrompt },
+			{
+				role: "user",
+				content: `
+Mode: ${studentState.mode}
+Topic: ${studentState.topic}
+Difficulty: ${studentState.difficulty}
+
+User input:
+${message}
+`,
+			},
+		];
+
+		let reply;
 		let parsedReply;
-		try {
-			parsedReply = JSON.parse(reply);
-		} catch (parseError) {
-			console.error("Failed to parse LLM JSON:", parseError);
-			return res.status(502).json({ error: "Invalid JSON from LLM" });
+		let lastParseError;
+		for (let attempt = 1; attempt <= 3; attempt += 1) {
+			reply = await generateReply(messages);
+			try {
+				parsedReply = JSON.parse(reply);
+				lastParseError = null;
+				break;
+			} catch (parseError) {
+				lastParseError = parseError;
+				console.error(
+					`Failed to parse LLM JSON (attempt ${attempt}):`,
+					parseError,
+				);
+			}
 		}
 
-		if (!parsedReply.is_math_question) {
-			return res.status(400).json({ error: "Not a math question" });
+		if (!parsedReply) {
+			console.error("All JSON parse attempts failed:", lastParseError);
+			return res
+				.status(502)
+				.json({ error: "Server issue. Please try again in some time" });
+		}
+		if (studentState.mode === "assessment") {
+			studentState.problemsSolved += 1;
+			if (parsedReply.is_correct === true) {
+				studentState.correctAnswers += 1;
+			}
+		} else {
+			studentState.problemsSolved += 1;
+			if (studentState.problemsSolved >= 5) {
+				studentState.mode = "assessment";
+			}
 		}
 
-		conversation.push({ role: "assistant", content: reply });
-
-		console.log("After generating AI response", conversation);
-
-		if (conversation.length > 3) {
-			conversation.splice(1, conversation.length - 2);
-		}
-
-		return res.status(200).json(parsedReply);
+		return res.status(200).json({
+			...parsedReply,
+			topic: studentState.topic,
+		});
 	} catch (error) {
 		console.error("Chat route error:", error);
 		const status = error.statusCode || 500;
