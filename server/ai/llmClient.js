@@ -194,7 +194,131 @@ async function generateReply(messages, attempt = 1) {
 	return content;
 }
 
+function extractStreamDelta(payload) {
+	if (!payload || typeof payload !== "object") {
+		return "";
+	}
+
+	if (payload.type === "response.output_text.delta") {
+		return payload.delta || payload.text || "";
+	}
+
+	if (payload.type === "response.message.delta") {
+		return payload.delta || "";
+	}
+
+	return "";
+}
+
+async function streamReply(messages, options = {}) {
+	if (!OPENAI_API_KEY) {
+		const error = new Error("OPENAI_API_KEY is not set");
+		error.statusCode = 500;
+		throw error;
+	}
+
+	const attempt = options.attempt || 1;
+	const onChunk = options.onChunk;
+	const signal = options.signal;
+	const input = messages.map((message) => ({
+		role: message.role,
+		content: message.content,
+	}));
+
+	const response = await fetch("https://api.openai.com/v1/responses", {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json",
+			Authorization: `Bearer ${OPENAI_API_KEY}`,
+		},
+		body: JSON.stringify({
+			model: "gpt-5-mini",
+			input,
+			reasoning: {
+				effort: "low",
+			},
+			text: {
+				verbosity: "low",
+				format: {
+					type: "text",
+				},
+			},
+			max_output_tokens: attempt === 1 ? 800 : 1500,
+			stream: true,
+		}),
+		signal,
+	});
+
+	if (!response.ok) {
+		let errorDetail = "LLM API request failed";
+		try {
+			const errorBody = await response.json();
+			errorDetail = errorBody?.error?.message || errorDetail;
+		} catch (parseError) {
+			// ignore parsing errors
+		}
+
+		const error = new Error(errorDetail);
+		error.statusCode = response.status;
+		throw error;
+	}
+
+	if (!response.body) {
+		const error = new Error("LLM API returned empty stream");
+		error.statusCode = 502;
+		throw error;
+	}
+
+	const reader = response.body.getReader();
+	const decoder = new TextDecoder();
+	let buffer = "";
+	let fullText = "";
+
+	while (true) {
+		const { value, done } = await reader.read();
+		if (done) {
+			break;
+		}
+		buffer += decoder.decode(value, { stream: true });
+		const lines = buffer.split(/\r?\n/);
+		buffer = lines.pop() || "";
+
+		for (const line of lines) {
+			const trimmed = line.trim();
+			if (!trimmed || !trimmed.startsWith("data:")) {
+				continue;
+			}
+
+			const data = trimmed.slice(5).trim();
+			if (!data) {
+				continue;
+			}
+			if (data === "[DONE]") {
+				return fullText;
+			}
+
+			let payload;
+			try {
+				payload = JSON.parse(data);
+			} catch (parseError) {
+				continue;
+			}
+
+			const delta = extractStreamDelta(payload);
+			if (delta) {
+				fullText += delta;
+				if (typeof onChunk === "function") {
+					onChunk(delta);
+				}
+			}
+		}
+	}
+
+	return fullText;
+}
+
 module.exports = {
 	classifyUserIntent,
 	generateReply,
+	streamReply,
 };
